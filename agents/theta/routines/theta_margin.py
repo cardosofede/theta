@@ -10,8 +10,6 @@ from telegram.ext import ContextTypes
 import importlib.util
 from pathlib import Path as _P
 
-import asyncio
-
 
 def _theta_mod(name: str):
     path = _P(__file__).with_name(name + ".py")

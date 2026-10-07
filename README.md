@@ -78,7 +78,7 @@ The minimum binds at small sizes, so converting **30 XRP costs 30.30 XRP** — n
 ### Two things that will cost you money
 
 - **Mint only to a Flare EOA whose private key you hold.** The mint recipient is not the same thing as a Derive address. Minting to a contract-wallet address strands the FXRP — it is a contract on Derive (chain 957) and a *keyless* EOA on Flare (chain 14), so no session key can ever spend it. `mint_fxrp.mjs` refuses one known address of exactly this kind.
-- **The Derive hop is manual, and cannot be automated.** Flare is chain **14**, Derive is chain **957**, and FXRP is a different contract on each. Derive's REST `/private/deposit` assumes the asset is *already* on 957 — it does not bridge, and there is no supported programmatic bridge. This is the one manual step in THETA's funding path, and the reason `theta_park` cannot self-fund.
+- **The Derive hop is manual, and cannot be automated.** Flare is chain **14**, Derive is chain **957**, and FXRP is a different contract on each. Derive v3 removed the `private/deposit` RPC — deposits are on-chain transactions (see [Depositing](https://docs.derive.xyz/getting-started/depositing)) and there is no supported programmatic bridge from Flare. This is the one manual step in THETA's funding path, and the reason `theta_park` only checks the posted FXRP and never self-funds.
 
 The mint is also not instant: `tesSUCCESS` on XRPL means the payment landed, then Flare executors finalise it. Poll the FXRP balance; do not re-send.
 

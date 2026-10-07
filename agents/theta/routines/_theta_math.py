@@ -23,12 +23,31 @@ def tape_gate(premium_pct: float | None, write_min_pct: float) -> str:
     return SIT
 
 
+def _option_parts(name: str) -> list[str] | None:
+    """``[CCY, YYYYMMDD, STRIKE, C|P]`` from a Derive option name.
+
+    v3 may append a risk-universe id (``XRP-20260821-1_05-C-42``); it is dropped.
+    """
+    parts = (name or "").split("-")
+    if len(parts) == 5 and parts[4].isdigit():
+        parts = parts[:4]
+    if len(parts) != 4 or parts[3] not in ("C", "P"):
+        return None
+    return parts
+
+
+def option_kind(name: str) -> str | None:
+    """``"C"`` / ``"P"`` for a Derive option name, else None."""
+    parts = _option_parts(name)
+    return parts[3] if parts else None
+
+
 def strike_from_name(name: str) -> float | None:
     """Parse Derive name ``XRP-20260821-1_05-C`` → 1.05."""
-    parts = (name or "").split("-")
-    if len(parts) < 4:
+    parts = _option_parts(name)
+    if parts is None:
         return None
-    raw = parts[-2].replace("_", ".")
+    raw = parts[2].replace("_", ".")
     try:
         val = float(raw)
     except ValueError:

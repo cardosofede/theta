@@ -12,11 +12,19 @@ tools:
 - get_executor
 - create_position_executor
 - stop_executor
-- manage_routines
+- delegate
+- send_notification
+- run_code
 - manage_memory
+- manage_skill
+- manage_routines
+- manage_agent_controllers
 - trading_agent_journal_read
 - trading_agent_journal_write
-- send_notification
+- manage_agents
+- manage_loops
+- control_agent
+- get_available_models
 when_to_consult: When the user asks about THETA — parked FXRP, the matching
   XRP hedge, hourly funding, or the SIT/WRITE options tape.
 server_required: false

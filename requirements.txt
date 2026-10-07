@@ -1,13 +1,14 @@
 # THETA — Derive funding desk
 #
-# Only the OPTIONS / PARK path signs Derive actions locally. The perpetual
-# hedge is executed by Hummingbot's own derive_perpetual connector and does
-# NOT need any of these. Install them to arm the covered-call wing:
+# The routines that talk to Derive's v3 API directly (theta_margin,
+# theta_park, theta_option_ticket) sign the auth header and, for the
+# covered-call wing, the order. The perpetual hedge is executed by
+# Hummingbot's own derive_perpetual connector and does NOT need these.
 #
 #   pip install -r requirements.txt
 #
-# If they are absent, theta_option_ticket and theta_park fail with an
-# explanatory error instead of a bare ModuleNotFoundError.
+# If they are absent, those routines fail with an explanatory error instead
+# of a bare ModuleNotFoundError.
 eth-account>=0.11.0
 eth-utils>=4.0.0
 eth-abi>=5.0.0

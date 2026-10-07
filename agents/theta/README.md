@@ -78,7 +78,7 @@ The minimum binds at small sizes, so converting **30 XRP costs 30.30 XRP** — n
 ### Two things that will cost you money
 
 - **Mint only to a Flare EOA whose private key you hold.** The mint recipient is not the same thing as a Derive address. Minting to a contract-wallet address strands the FXRP — it is a contract on Derive (chain 957) and a *keyless* EOA on Flare (chain 14), so no session key can ever spend it. `mint_fxrp.mjs` refuses one known address of exactly this kind.
-- **The Derive hop is manual, and cannot be automated.** Flare is chain **14**, Derive is chain **957**, and FXRP is a different contract on each. Derive's REST `/private/deposit` assumes the asset is *already* on 957 — it does not bridge, and there is no supported programmatic bridge. This is the one manual step in THETA's funding path, and the reason `theta_park` cannot self-fund.
+- **The Derive hop is manual, and cannot be automated.** Flare is chain **14**, Derive is chain **957**, and FXRP is a different contract on each. Derive v3 removed the `private/deposit` RPC — deposits are on-chain transactions (see [Depositing](https://docs.derive.xyz/getting-started/depositing)) and there is no supported programmatic bridge from Flare. This is the one manual step in THETA's funding path, and the reason `theta_park` only checks the posted FXRP and never self-funds.
 
 The mint is also not instant: `tesSUCCESS` on XRPL means the payment landed, then Flare executors finalise it. Poll the FXRP balance; do not re-send.
 
@@ -129,7 +129,7 @@ agents/theta/
 
 | Step | Source | Decision |
 |---:|---|---|
-| 0 · Park | `theta_park` | Post FXRP if missing; leave USDC sleeve free (`park_dry_run` until flipped) |
+| 0 · Park | `theta_park` | Check FXRP posted vs target (read-only); leave USDC sleeve free |
 | 1 · Tape | `theta_tape` | **SIT** or **WRITE** · hour funding · nearest week call. Dead board → SIT. Never invent a strike. |
 | 2 · Room | `theta_margin` | Leftover IM · allowed short (free-margin cap) · TIGHT or not. TIGHT → no add. |
 | 3 · Book | portfolio | Net XRP-USDC perp. Open only if \|net\| ≥ $1. |
@@ -260,7 +260,7 @@ pile in one or two deposits to the Flare EOA you control, then:
 > Derive → Deposit → **Flare** → **FXRP** → THETA subaccount
 
 Recipient must be a Flare EOA whose key you hold (not the Derive owner
-address). `park_dry_run: true` until FXRP is posted; then the loop hedges.
+address). Once `theta_park` reports **done**, the loop hedges at full size.
 
 **Race P&L / volume intent:** funding on the working short while FXRP stays
 parked (P&L); OPEN / pump-CUT / RELOAD / REOPEN fills (volume). Options are
@@ -283,7 +283,7 @@ From `loops/theta_funding_desk/loop.md`:
 | Barriers | SL **0.04** · TP 0.50 · time 172800 · no trail · `open_order_type: 2` |
 | RELOAD band | inside +2% of last entry |
 | Pump cut | +4% |
-| `park_auto` / `park_dry_run` | true / true until flipped |
+| `park_auto` | true (read-only FXRP check) |
 
 Executor size = free-margin cap from the margin clerk (not `wallet/2`):
 

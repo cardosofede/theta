@@ -1,7 +1,8 @@
 """Read Derive's public XRP board. Print SIT or WRITE. Never place an order.
 
-Public REST only. This clerk does not sign, does not POST /private/*, and
-does not talk to Hummingbot. A dead board is SIT.
+Public v3 REST only (https://api.derive.xyz/v3/public/*). This clerk does not
+sign, does not POST /private/*, and does not talk to Hummingbot. A dead board
+is SIT.
 """
 
 from __future__ import annotations
@@ -33,12 +34,13 @@ WRITE = _math.WRITE
 call_premium_pct = _math.call_premium_pct
 tape_gate = _math.tape_gate
 strike_from_name = _math.strike_from_name
+option_kind = _math.option_kind
 
 logger = logging.getLogger(__name__)
 
 CATEGORY = "Market Data"
 
-_PUBLIC = "https://api.lyra.finance/public"
+_PUBLIC = "https://api.derive.xyz/v3/public"
 
 
 class Config(BaseModel):
@@ -76,56 +78,73 @@ async def _perp(session: aiohttp.ClientSession, instrument: str) -> dict:
         return {}
 
 
-async def _instruments(session: aiohttp.ClientSession, currency: str) -> list[dict]:
+def _num(ticker: dict, *keys: str) -> float:
+    """First positive numeric value among ``keys`` (v3 slim tickers are strings)."""
+    for key in keys:
+        try:
+            val = float(ticker.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    return 0.0
+
+
+def _spot(ticker: dict) -> float:
+    """Index price, else mark (v3 slim ticker: ``I`` / ``M``)."""
+    return _num(ticker, "I", "M")
+
+
+def _funding(ticker: dict) -> float:
+    """Hourly funding rate (v3 slim ticker: ``f``; may be negative)."""
     try:
-        data = await _post(
-            session,
-            "/get_instruments",
-            {"currency": currency, "expired": False, "instrument_type": "option"},
-        )
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("instruments") or data.get("result") or []
-        return []
+        return float(ticker.get("f") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _instruments(session: aiohttp.ClientSession, currency: str) -> list[dict]:
+    """All live options for ``currency`` (``public/get_all_instruments``, paginated)."""
+    out: list[dict] = []
+    page, pages = 1, 1
+    try:
+        while page <= pages:
+            data = await _post(
+                session,
+                "/get_all_instruments",
+                {
+                    "currency": currency,
+                    "expired": False,
+                    "instrument_type": "option",
+                    "page": page,
+                    "page_size": 100,
+                },
+            )
+            out.extend(data.get("instruments") or [])
+            pages = int((data.get("pagination") or {}).get("num_pages") or 1)
+            page += 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("theta_tape instruments failed: %s", exc)
-        return []
+    return out
 
 
 async def _tickers(session: aiohttp.ClientSession, currency: str, expiry: str) -> list[dict]:
+    """Option tickers for one expiry (``public/get_tickers`` → ``{name: slim ticker}``)."""
     try:
         data = await _post(
             session,
             "/get_tickers",
-            {
-                "currency": currency,
-                "expired": False,
-                "instrument_type": "option",
-                "expiry_date": expiry,
-            },
+            {"currency": currency, "instrument_type": "option", "expiry_date": int(expiry)},
         )
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            raw = data.get("tickers")
-            if isinstance(raw, dict):
-                out = []
-                for name, row in raw.items():
-                    if not isinstance(row, dict):
-                        continue
-                    item = dict(row)
-                    item.setdefault("instrument_name", name)
-                    out.append(item)
-                return out
-            if isinstance(raw, list):
-                return raw
-            if isinstance(data.get("result"), list):
-                return data["result"]
-        return []
     except Exception as exc:  # noqa: BLE001
         logger.warning("theta_tape tickers %s failed: %s", expiry, exc)
         return []
+    raw = data.get("tickers") or {}
+    return [
+        {**row, "instrument_name": name}
+        for name, row in raw.items()
+        if isinstance(row, dict)
+    ]
 
 
 def _expiry_yyyymmdd(inst: dict) -> str | None:
@@ -145,8 +164,7 @@ def _expiry_yyyymmdd(inst: dict) -> str | None:
 def _is_call(inst: dict) -> bool:
     details = inst.get("option_details") or {}
     kind = str(details.get("option_type") or inst.get("option_type") or "").lower()
-    name = str(inst.get("instrument_name") or "")
-    return kind in {"c", "call"} or name.endswith("-C") or name.endswith("-CALL")
+    return kind in {"c", "call"} or option_kind(str(inst.get("instrument_name") or "")) == "C"
 
 
 def _strike(inst: dict) -> float | None:
@@ -165,14 +183,7 @@ def _mark(ticker: dict) -> float | None:
     pricing = ticker.get("option_pricing")
     if not isinstance(pricing, dict):
         pricing = {}
-    for raw in (
-        ticker.get("M"),
-        ticker.get("mark_price"),
-        ticker.get("mark"),
-        pricing.get("m"),
-        ticker.get("b"),
-        ticker.get("best_bid_price"),
-    ):
+    for raw in (ticker.get("M"), pricing.get("m"), ticker.get("b")):
         if raw is None:
             continue
         try:
@@ -200,59 +211,50 @@ def _pick_otm_call(tickers: list[dict], spot: float, otm_min_pct: float) -> dict
     return scored[0][1]
 
 
+def _near_expiries(instruments: list[dict], max_dte: int) -> list[str]:
+    """Distinct YYYYMMDD expiries of active options within ``max_dte`` days, soonest first."""
+    today = datetime.now(tz=timezone.utc)
+    out: set[str] = set()
+    for inst in instruments:
+        if not inst.get("is_active", True):
+            continue
+        exp = _expiry_yyyymmdd(inst)
+        if not exp:
+            continue
+        dte = (datetime.strptime(exp, "%Y%m%d").replace(tzinfo=timezone.utc) - today).days
+        if 0 <= dte <= max_dte:
+            out.add(exp)
+    return sorted(out)
+
+
+async def read_board(
+    currency: str = "XRP",
+    perp_instrument: str = "XRP-PERP",
+    max_dte: int = 10,
+    otm_min_pct: float = 5.0,
+) -> tuple[float, float, dict | None, str | None]:
+    """(spot, hourly funding, nearest OTM call ticker or None, its expiry)."""
+    async with aiohttp.ClientSession() as session:
+        perp, instruments = await asyncio.gather(
+            _perp(session, perp_instrument),
+            _instruments(session, currency),
+        )
+        spot, funding = _spot(perp), _funding(perp)
+        if spot <= 0:
+            return spot, funding, None, None
+        for exp in _near_expiries(instruments, max_dte):
+            cand = _pick_otm_call(await _tickers(session, currency, exp), spot, otm_min_pct)
+            if cand is not None:
+                return spot, funding, cand, exp
+    return spot, funding, None, None
+
+
 async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     """Return a one-page blotter. Never a fill."""
     del context
-    async with aiohttp.ClientSession() as session:
-        perp, instruments = await asyncio.gather(
-            _perp(session, config.perp_instrument),
-            _instruments(session, config.currency),
-        )
-
-        spot = 0.0
-        for key in ("index_price", "mark_price", "last_price"):
-            try:
-                spot = float(perp.get(key) or 0)
-            except (TypeError, ValueError):
-                spot = 0.0
-            if spot > 0:
-                break
-
-        funding = 0.0
-        details = perp.get("perp_details") or {}
-        try:
-            funding = float(details.get("funding_rate") or perp.get("funding_rate") or 0)
-        except (TypeError, ValueError):
-            funding = 0.0
-
-        today = datetime.now(tz=timezone.utc)
-        expiries: list[str] = []
-        seen: set[str] = set()
-        for inst in instruments:
-            if not inst.get("is_active", True):
-                continue
-            exp = _expiry_yyyymmdd(inst)
-            if not exp or exp in seen:
-                continue
-            try:
-                dte = (datetime.strptime(exp, "%Y%m%d").replace(tzinfo=timezone.utc) - today).days
-            except ValueError:
-                continue
-            if 0 <= dte <= config.max_dte:
-                seen.add(exp)
-                expiries.append(exp)
-        expiries.sort()
-
-        pick = None
-        pick_exp = None
-        if spot > 0:
-            for exp in expiries:
-                tickers = await _tickers(session, config.currency, exp)
-                cand = _pick_otm_call(tickers, spot, config.otm_min_pct)
-                if cand is not None:
-                    pick = cand
-                    pick_exp = exp
-                    break
+    spot, funding, pick, pick_exp = await read_board(
+        config.currency, config.perp_instrument, config.max_dte, config.otm_min_pct
+    )
 
     premium = call_premium_pct(_mark(pick) if pick else None, spot if spot > 0 else None)
     gate = tape_gate(premium, config.write_min_pct)

@@ -15,9 +15,9 @@ This is the only place a THETA XRP call may be written. It is **armored**:
   * ``amount`` must be >= the Derive option minimum (100 contracts — step 10,
     confirmed live via /public/get_instruments ``minimum_amount``). A sub-minimum
     order is refused, never sent, so a weak size cannot pretend to fill.
-  * It reuses the direct-Derive order path (``_theta_derive.order``). The option
-    wire format (TradeModuleData keyed by instrument_name) was fixed and verified
-    via /private/order_debug.
+  * It reuses the direct-Derive v3 order path (``_theta_derive.order``): a
+    trade-module SignedAction keyed by the option's base asset address and
+    sub_id. ``private/order_debug`` shows the server-side hashes if it fails.
 
 Selling an XRP call against FXRP is a COVERED call: the held FXRP offsets the
 short-call liability, so this is income, not naked risk — provided the FXRP cover
@@ -27,13 +27,23 @@ Exit: buy-to-close (buy the same call back) anytime to release FXRP — no lock-
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path as _P
-from pydantic import BaseModel, Field
 
-# We import the Derive helper lazily so the routine is importable even if the
-# Condor keystore / network are unavailable (dry-run must still describe).
+from pydantic import BaseModel, Field
 from telegram.ext import ContextTypes
+
+
+def _theta_mod(name: str):
+    path = _P(__file__).with_name(name + ".py")
+    spec = importlib.util.spec_from_file_location("theta_" + name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(name)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 CATEGORY = "Monitoring"
 
@@ -73,60 +83,18 @@ def _is_armed() -> bool:
 
 
 async def _auto_pick_write() -> tuple[str | None, float]:
-    """Reuse theta_tape's board logic to pick the current WRITE call + premium.
-    Returns (instrument_name, mark_premium). Used when the loop calls the wing
-    without a full ticket so the wing still fires on a WRITE tick."""
-    import importlib.util as _ilu
-    import aiohttp
-    from datetime import datetime, timezone
+    """Pick the current WRITE call + mark premium from theta_tape's board.
 
-    tape = _ilu.spec_from_file_location(
-        "theta_tape_dyn", _P(__file__).with_name("theta_tape.py")
-    )
-    if tape is None or tape.loader is None:
-        return None, 0.02
-    mod = _ilu.module_from_spec(tape)
-    tape.loader.exec_module(mod)
+    Used when the loop calls the wing without a full ticket so the wing still
+    fires on a WRITE tick. Returns (None, 0.02) on a dead board."""
+    tape = _theta_mod("theta_tape")
     try:
-        async with aiohttp.ClientSession() as s:
-            perp = await mod._perp(s, "XRP-PERP")
-            insts = await mod._instruments(s, "XRP")
-            spot = 0.0
-            for k in ("index_price", "mark_price", "last_price"):
-                try:
-                    spot = float(perp.get(k) or 0)
-                except (TypeError, ValueError):
-                    spot = 0.0
-                if spot > 0:
-                    break
-            today = datetime.now(tz=timezone.utc)
-            expiries: list[str] = []
-            seen: set[str] = set()
-            for inst in insts:
-                if not inst.get("is_active", True):
-                    continue
-                exp = mod._expiry_yyyymmdd(inst)
-                if not exp or exp in seen:
-                    continue
-                try:
-                    dte = (
-                        datetime.strptime(exp, "%Y%m%d").replace(tzinfo=timezone.utc)
-                        - today
-                    ).days
-                except ValueError:
-                    continue
-                if 0 <= dte <= 10:
-                    seen.add(exp)
-                    expiries.append(exp)
-            expiries.sort()
-            for exp in expiries:
-                tks = await mod._tickers(s, "XRP", exp)
-                cand = mod._pick_otm_call(tks, spot, 5.0)
-                if cand:
-                    return cand.get("instrument_name"), (mod._mark(cand) or 0.02)
-    except Exception:
-        pass
-    return None, 0.02
+        _spot, _funding, pick, _exp = await tape.read_board()
+    except Exception:  # noqa: BLE001
+        return None, 0.02
+    if not pick:
+        return None, 0.02
+    return pick.get("instrument_name"), (tape._mark(pick) or 0.02)
 
 
 class Config(BaseModel):
@@ -197,15 +165,9 @@ def ticket_verdict(config: Config, live_env: str | None = None) -> str:
 
 async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     del context
-    import importlib.util
-    import pathlib
 
     async def _publish(text: str, kpis: list[tuple]) -> str:
-        routines = pathlib.Path(__file__).parent
-        spec = importlib.util.spec_from_file_location("_theta_math", routines / "_theta_math.py")
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
-        rid = await m.save_report(
+        rid = await _theta_mod("_theta_math").save_report(
             "THETA option ticket",
             "theta_option_ticket",
             kpis,
@@ -254,14 +216,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     if config.action.lower() == "sell" and config.amount < MIN_OPTION_CONTRACTS:
         config.amount = float(MIN_OPTION_CONTRACTS)
 
-    def _load(mod_path: str):
-        spec = importlib.util.spec_from_file_location("_theta_derive", mod_path)
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
-        return m
-
-    routines = pathlib.Path(__file__).parent
-    der = _load(str(routines / "_theta_derive.py"))
+    der = _theta_mod("_theta_derive")
     try:
         creds = der.from_condor_keystore()
     except Exception as exc:  # pragma: no cover
@@ -280,24 +235,3 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     except Exception as exc:
         return await _publish(f"FAILED to submit {config.action}: {exc}", kpis)
     return await _publish(f"SUBMITTED {config.action}: {res}", kpis)
-
-
-# ---- helper to keep backward compatibility with the old name pattern ----
-def build_ticket(*, action, instrument, amount, limit_price):
-    c = Config(instrument=instrument, amount=amount, limit_price=limit_price, action=action)
-    return _build_ticket(c)
-
-
-def ticket_verdict_old(config_cfg, live_env=None):
-    """Thin shim for any caller that used the pre-refactor Config shape."""
-    return ticket_verdict(
-        Config(
-            instrument=getattr(config_cfg, "instrument", ""),
-            amount=getattr(config_cfg, "amount", 0.0),
-            limit_price=getattr(config_cfg, "limit_price", 0.0),
-            action=getattr(config_cfg, "action", "sell"),
-            dry_run=getattr(config_cfg, "dry_run", True),
-            gate=getattr(config_cfg, "gate", "SIT"),
-        ),
-        live_env,
-    ) if getattr(config_cfg, "gate", "SIT") == "WRITE" else f"REFUSED — gate {getattr(config_cfg,'gate','SIT')} ≠ WRITE."

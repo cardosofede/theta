@@ -1,21 +1,23 @@
-"""Thin client for Derive's native REST API.
+"""Thin client for Derive's v3 JSON-RPC REST API (https://docs.derive.xyz).
 
-Used by ``theta_park`` to turn USDC into posted FXRP margin so THETA can
-start from a USDC-only account. Hummingbot's ``derive_perpetual`` connector
-is perps-only (no spot / convert / wrap), so we talk to Derive directly.
+Used by ``theta_park`` / ``theta_margin`` to read the subaccount and by
+``theta_option_ticket`` to place the covered call. Hummingbot's
+``derive_perpetual`` connector is perps-only, so options go direct.
 
-Auth (Derive scheme, from hummingbot's derive_auth.py):
-    POST https://api.lyra.finance/private/<method>
+Auth (v3, https://docs.derive.xyz/authentication/session-login):
+    POST https://api.derive.xyz/v3/private/<method>
     headers:
-        accept:            application/json
-        X-LyraWallet:      <api_key = wallet address>
-        X-LyraTimestamp:   <ms epoch>
-        X-LyraSignature:   personal_sign(timestamp, api_secret)
-    where api_secret is an Ethereum private key and the signature is an
-    EIP-191 personal_sign (keccak256("\\x19Ethereum Signed Message:\\n" + len + msg)).
+        X-DeriveWallet:     <api_key = owner EOA / multisig>
+        X-DeriveTimestamp:  <ms epoch>
+        X-DeriveSignature:  personal_sign(timestamp, api_secret)
+    where api_secret is the wallet key or a registered session key.
+
+Orders are EIP-712 SignedActions over the trade module
+(https://docs.derive.xyz/authentication/action-signing). v3 nonces are UTC
+nanoseconds sent as a string; the domain separator is Ethereum mainnet's.
 
 No network happens at import time. Every public method is explicit about
-whether it reads (safe) or writes (convert/wrap).
+whether it reads (safe) or writes (order).
 """
 
 from __future__ import annotations
@@ -28,18 +30,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+import threading
+from decimal import ROUND_HALF_UP, Decimal
+
 import aiohttp
-import asyncio
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from ecdsa import SigningKey, SECP256k1, numbertheory
-from ecdsa.util import sigencode_string_canonize
 
 # The desk's own Derive subaccount (SM manager). Override with DERIVE_SUBACCOUNT.
 THETA_DEFAULT_SUB = "70652"
 
-DERIVE_BASE = "https://api.lyra.finance"
-# Private endpoint prefix on Derive's REST API.
-_PRIVATE = "/private"
+# v3 mainnet. Testnet is https://testnet.api.derive.xyz/v3.
+DERIVE_BASE = os.environ.get("DERIVE_API_BASE", "https://api.derive.xyz/v3").rstrip("/")
 
 # Where a Hummingbot/Condor install stores the encrypted Derive credential,
 # and the .env that holds the keystore passphrase (CONFIG_PASSWORD). theta
@@ -114,20 +115,13 @@ def _find_field(text: str, names: tuple[str, ...]) -> tuple[str, str] | None:
             return name, m.group(1)
     return None
 
-# Derive v2 protocol constants (production, chain 957). From docs.derive.xyz
-# and hummingbot's derive_constants.py / derive_common_utils.py.
+# Derive v3 signing constants (mainnet). From docs.derive.xyz
+# /migrating/breaking-changes and derive-py config/contracts.py. The domain
+# separator is per chain (mainnet chainId 1); typehash and module are shared.
 _PROTOCOL = {
-    "domain": "https://api.lyra.finance",
-    "chain_id": 957,
     "trade_module_address": "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b",
-    "domain_separator": "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b",
+    "domain_separator": "0xda616dfabb88681b08e1592820a41d55ddc62d68de110e327ae99d734506fe19",
     "action_typehash": "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17",
-    "asset_addresses": {
-        # Derive-chain ERC20 addresses (spot) from public/get_all_currencies
-        "XRP": "0x1DD2b6E9Db6654BB949be09b30d4193A94bbbfaE",
-        "FXRP": "0x7F1FfBF00B05A280298C843f02ca293209756B49",
-        "USDC": "0x57B03E14d409ADC7fAb6CFc44b5886CAD2D5f02b",
-    },
 }
 
 
@@ -320,58 +314,54 @@ def _personal_sign(message: str, private_key_hex: str) -> str:
 
 
 def auth_headers(creds: dict[str, str]) -> dict[str, str]:
-    """Derive REST auth headers (X-LyraWallet / X-LyraTimestamp / X-LyraSignature)."""
+    """Derive v3 REST auth headers (X-DeriveWallet / X-DeriveTimestamp / X-DeriveSignature)."""
     ts = str(int(time.time() * 1000))
-    sig = _personal_sign(ts, creds["api_secret"])
-    h = {
-        "accept": "application/json",
-        "X-LyraWallet": creds["api_key"],
-        "X-LyraTimestamp": ts,
-        "X-LyraSignature": sig,
+    return {
+        "X-DeriveWallet": creds["api_key"],
+        "X-DeriveTimestamp": ts,
+        "X-DeriveSignature": _personal_sign(ts, creds["api_secret"]),
     }
-    if creds.get("sub_id"):
-        h["subaccount-id"] = creds["sub_id"]
-    if creds.get("account_type"):
-        h["account-type"] = creds["account_type"]
-    return h
 
 
-async def _post(creds: dict[str, str], method: str, payload: dict[str, Any]) -> Any:
-    body = json.dumps(payload)
-    url = f"{DERIVE_BASE}{_PRIVATE}/{method}"
-    headers = auth_headers(creds)
-    headers["Content-Type"] = "application/json"
+async def _rpc(path: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> Any:
+    """POST one JSON-RPC call to ``{DERIVE_BASE}/{path}`` and return ``result``."""
+    url = f"{DERIVE_BASE}/{path}"
+    hdrs = {"accept": "application/json", "Content-Type": "application/json", **(headers or {})}
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            url, data=body, headers=headers,
+            url, data=json.dumps(params), headers=hdrs,
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             text = await resp.text()
             if resp.status >= 400:
-                raise RuntimeError(f"Derive {method} -> {resp.status}: {text}")
+                raise RuntimeError(f"Derive {path} -> {resp.status}: {text}")
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
-                raise RuntimeError(f"Derive {method} bad JSON: {text}")
+                raise RuntimeError(f"Derive {path} bad JSON: {text}")
             if isinstance(data, dict) and data.get("error"):
-                raise RuntimeError(f"Derive {method} error: {data['error']}")
-            return data.get("result", data)
+                raise RuntimeError(f"Derive {path} error: {data['error']}")
+            return data.get("result", data) if isinstance(data, dict) else data
+
+
+async def public(method: str, params: dict[str, Any]) -> Any:
+    """Unauthenticated ``public/<method>`` call."""
+    return await _rpc(f"public/{method}", params)
+
+
+async def _post(creds: dict[str, str], method: str, params: dict[str, Any]) -> Any:
+    """Authenticated ``private/<method>`` call."""
+    return await _rpc(f"private/{method}", params, auth_headers(creds))
 
 
 # ── Read-only ──────────────────────────────────────────────────────────────
 
 async def get_account_summary(creds: dict[str, str]) -> dict[str, Any]:
-    """Read subaccount balances / collateral via Derive's ``/private/get_subaccount``.
+    """Read subaccount balances / margin via ``private/get_subaccount``.
 
-    Derive requires ``wallet`` + ``subaccount_id`` in the request body.
+    v3 takes only ``subaccount_id``; the wallet comes from the auth headers.
     """
-    payload: dict[str, Any] = {"wallet": creds["api_key"]}
-    if creds.get("sub_id"):
-        try:
-            payload["subaccount_id"] = int(creds["sub_id"])
-        except ValueError:
-            payload["subaccount_id"] = creds["sub_id"]
-    return await _post(creds, "get_subaccount", payload)
+    return await _post(creds, "get_subaccount", {"subaccount_id": int(creds["sub_id"])})
 
 
 async def get_balances(creds: dict[str, str]) -> dict[str, float]:
@@ -380,9 +370,8 @@ async def get_balances(creds: dict[str, str]) -> dict[str, float]:
     out: dict[str, float] = {}
     if not isinstance(summary, dict):
         return out
-    # Derive returns collaterals: [{asset_name, amount, ...}]
     for row in summary.get("collaterals", []) or []:
-        asset = row.get("asset_name") or row.get("asset") or row.get("currency")
+        asset = row.get("asset_name")
         amt = row.get("amount")
         if asset and amt is not None:
             try:
@@ -392,83 +381,11 @@ async def get_balances(creds: dict[str, str]) -> dict[str, float]:
     return out
 
 
-# ── Writes (deposit / wrap / convert) ──────────────────────────────────────
+# ── Signing ────────────────────────────────────────────────────────────────
 
 def _eth_account(api_secret: str):
     Account, _ = _require_eth_account()
-
     return Account.from_key(api_secret)
-
-
-def _signed_action(creds: dict[str, str], module_data: dict, action_type: str) -> dict:
-    """Build + sign a Derive EIP-712 SignedAction and return the wire payload.
-
-    ``module_data`` varies by action type (see below). The signature is the
-    EIP-712 typed-data hash signed by the subaccount signer key. ``owner`` is
-    the wallet (api_key) and ``signer`` the session key (api_secret-derived).
-    Nonce = <utc_ms><6 random digits> per Derive spec.
-    """
-    import time as _time
-    import random as _random
-
-    try:
-        from eth_abi import encode
-    except ModuleNotFoundError as exc:  # pragma: no cover - env dependent
-        raise RuntimeError(_ETH_MISSING) from exc
-
-    owner = creds["api_key"]
-    sub_id = int(creds["sub_id"] or 0)
-    signer_addr = _eth_account(creds["api_secret"]).address
-    # Derive requires strictly-increasing, unique nonces. Use a monotonic
-    # counter combined with utc_ms so repeated calls never collide or fall
-    # behind the server-tracked last nonce (which otherwise yields 14014).
-    import threading
-    _nonce_lock = getattr(_signed_action, "_lock", None)
-    if _nonce_lock is None:
-        _nonce_lock = threading.Lock()
-        _signed_action._lock = _nonce_lock
-    with _nonce_lock:
-        _last = getattr(_signed_action, "_last_nonce", 0)
-        cand = int(str(int(_time.time() * 1000)) + str(_random.randint(0, 999)))
-        nonce = max(_last + 1, cand)
-        _signed_action._last_nonce = nonce
-    expiry = int(_time.time()) + 600  # must be >5min from now; MAX_INT_32 is rejected by live API
-
-    proto = _PROTOCOL
-    module_address = proto["trade_module_address"]
-    domain_sep = proto["domain_separator"]
-    typehash = proto["action_typehash"]
-
-    # module_data: (abi_types, values) -> module hash
-    abi_types = module_data["abi_types"]
-    abi_values = module_data["abi_values"]
-    module_hash = _keccak256(encode(abi_types, abi_values))
-
-    hashed = _keccak256(
-        encode(
-            ["bytes32", "uint", "uint", "address", "bytes32", "uint", "address", "address"],
-            [bytes.fromhex(typehash[2:]), sub_id, nonce,
-             _checksum(module_address), bytes(module_hash), expiry,
-             _checksum(owner), _checksum(signer_addr)],
-        )
-    )
-    typed = _keccak256(b"\x19\x01" + bytes.fromhex(domain_sep[2:]) + bytes(hashed))
-    sig = _eth_account(creds["api_secret"]).unsafe_sign_hash(typed).signature
-    # validate locally: recovered signer must == signer_addr
-    Account, _ = _require_eth_account()
-
-    rec = Account._recover_hash(typed, signature=sig)
-    if rec.lower() != signer_addr.lower():
-        raise RuntimeError(f"SignedAction self-check failed: {rec} != {signer_addr}")
-
-    return {
-        "subaccount_id": sub_id,
-        "nonce": nonce,
-        "signer": signer_addr,
-        "signature_expiry_sec": expiry,
-        "signature": sig.hex(),
-        **module_data.get("extra", {}),
-    }
 
 
 def _checksum(addr: str) -> str:
@@ -476,158 +393,119 @@ def _checksum(addr: str) -> str:
         from eth_utils import to_checksum_address
     except ModuleNotFoundError as exc:  # pragma: no cover - env dependent
         raise RuntimeError(_ETH_MISSING) from exc
-
     return to_checksum_address(addr)
 
 
-async def deposit(creds: dict[str, str], asset_name: str, amount: float) -> dict[str, Any]:
-    """Deposit ``amount`` of ``asset_name`` (e.g. XRP) into the subaccount.
+_nonce_lock = threading.Lock()
+_last_nonce = 0
 
-    On Derive, depositing XRP yields FXRP collateral — this IS the wrap step.
-    Uses the SignedAction deposit pattern (POST /private/deposit).
+
+def _next_nonce() -> int:
+    """UTC-nanosecond nonce (v3). Strictly increasing within this process."""
+    global _last_nonce
+    with _nonce_lock:
+        _last_nonce = max(_last_nonce + 1, time.time_ns())
+        return _last_nonce
+
+
+def _signed_action(creds: dict[str, str], abi_types: list[str], abi_values: list[Any]) -> dict:
+    """Sign a trade-module SignedAction and return its wire fields.
+
+    hash = keccak256(0x1901 ‖ DOMAIN_SEPARATOR ‖ keccak256(abi.encode(
+        ACTION_TYPEHASH, subaccount_id, nonce, module, keccak256(data),
+        expiry, owner, signer)))
     """
-    module_data = {
-        "abi_types": ["address", "uint", "int", "int", "uint", "uint", "bool"],
-        "abi_values": [
-            _checksum(_PROTOCOL["asset_addresses"][asset_name]),
-            1,   # sub_id for the collateral bucket
-            0,   # limit_price (0 for a deposit)
-            _to_big(amount),  # amount
-            0,   # max_fee
-            int(creds["sub_id"] or 0),  # recipient subaccount
-            True,  # is_bid
-        ],
-        "extra": {"amount": str(amount), "asset_name": asset_name},
+    try:
+        from eth_abi import encode
+    except ModuleNotFoundError as exc:  # pragma: no cover - env dependent
+        raise RuntimeError(_ETH_MISSING) from exc
+
+    account = _eth_account(creds["api_secret"])
+    sub_id = int(creds["sub_id"])
+    nonce = _next_nonce()
+    expiry = int(time.time()) + 600  # v3 window: 10 s .. 120 days
+
+    action_hash = _keccak256(
+        encode(
+            ["bytes32", "uint256", "uint256", "address", "bytes32", "uint256", "address", "address"],
+            [
+                bytes.fromhex(_PROTOCOL["action_typehash"][2:]),
+                sub_id,
+                nonce,
+                _checksum(_PROTOCOL["trade_module_address"]),
+                _keccak256(encode(abi_types, abi_values)),
+                expiry,
+                _checksum(creds["api_key"]),
+                account.address,
+            ],
+        )
+    )
+    typed = _keccak256(b"\x19\x01" + bytes.fromhex(_PROTOCOL["domain_separator"][2:]) + action_hash)
+    sig = account.unsafe_sign_hash(typed).signature
+    return {
+        "subaccount_id": sub_id,
+        "nonce": str(nonce),
+        "signer": account.address,
+        "signature_expiry_sec": expiry,
+        "signature": "0x" + sig.hex().removeprefix("0x"),
     }
-    payload = _signed_action(creds, module_data, "deposit")
-    # deposit requires signer + signature in body (enum asset_name)
-    payload["asset_name"] = asset_name
-    payload["amount"] = str(amount)
-    return await _post(creds, "deposit", payload)
 
 
-def _to_big(value: float) -> int:
-    """Derive uses 18-decimal integer amounts (decimal_to_big_int in
-    derive_perpetual_web_utils: value * 10^18)."""
-    return int(round(value * 10 ** 18))
+def _decimal_str(value: Any) -> str:
+    """Canonical decimal string (max 12 dp — v3 rejects finer precision)."""
+    d = Decimal(str(value)).quantize(Decimal("1e-12"), rounding=ROUND_HALF_UP).normalize()
+    return format(d, "f")
 
 
+def _to_big(value: Any) -> int:
+    """18-decimal fixed point of the same string that goes on the wire."""
+    return int(Decimal(_decimal_str(value)) * 10**18)
 
-def _price_str(price) -> str:
-    """Canonical decimal string matching ``_to_big`` (no float format rounding)."""
-    from decimal import Decimal, ROUND_HALF_UP
-    d = Decimal(str(price)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-    # drop trailing zeros but keep enough precision that Decimal(str)==d for wire
-    s = format(d, "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s or "0"
 
+# ── Writes ─────────────────────────────────────────────────────────────────
 
 async def order(creds: dict[str, str], instrument_name: str, direction: str,
                 amount: float, limit_price: float, order_type: str = "limit",
                 time_in_force: str = "gtc", max_fee: float = 1000.0,
-                label: str = "theta_park", debug: bool = False) -> dict[str, Any]:
-    """Place an order on Derive (POST /private/order).
+                label: str = "theta", debug: bool = False) -> dict[str, Any]:
+    """Place an order on Derive v3 (``private/order``).
 
-    Follows Hummingbot's derive_exchange._create_order wire format exactly:
-    an EIP-712 SignedAction over TradeModuleData, signed with the api_secret,
-    then the flattened order fields in the body.
-
-    direction: "buy" | "sell". amount is in base units (XRP).
+    direction: "buy" | "sell". amount is in base units (contracts for options).
+    The signed TradeModuleData is (asset, sub_id, limit, amount, max_fee,
+    recipient, is_bid), keyed by the instrument's base asset address and
+    sub_id from ``public/get_instrument``. ``debug`` routes to
+    ``private/order_debug`` which returns the server-side hashes instead.
     """
-    symbol = instrument_name
-    # Look up the instrument's base_asset_address + base_asset_sub_id dynamically
-    # (options have per-expiry sub_ids; XRP-PERP is sub_id 0). Falls back to the
-    # known XRP constants only if the lookup fails.
-    import urllib.request as _ureq
-    base_asset_address = None
-    base_sub_id = "0"
-    instrument_type = "option" if symbol.endswith("-C") or symbol.endswith("-P") else "perp"
-    try:
-        # Derive sits behind Cloudflare, which blocks aiohttp's TLS fingerprint
-        # (HTTP 1010). urllib (with a browser UA) gets through — use that.
-        _hdrs = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Content-Type": "application/json",
-            "accept": "application/json",
-        }
-        _req = _ureq.Request(
-            "https://api.lyra.finance/public/get_instruments",
-            data=json.dumps({"currency": "XRP", "instrument_type": instrument_type, "expired": False}).encode(),
-            headers=_hdrs, method="POST",
-        )
-        _body = await asyncio.to_thread(_ureq.urlopen, _req, None, 20)
-        data = json.loads(_body.read().decode())
-        res = data.get("result") or data
-        if isinstance(res, dict):
-            res = res.get("instruments", [])
-        for it in res:
-            if it.get("instrument_name") == symbol:
-                base_asset_address = it.get("base_asset_address")
-                base_sub_id = str(it.get("base_asset_sub_id") or "0")
-                break
-        if not base_asset_address:
-            # Cloudflare likely blocked the lookup (empty result). This is a hard
-            # failure for options — never fall back to perp defaults (sub_id 0),
-            # which would sign a perp action for an option name -> Derive 14014.
-            if instrument_type == "option":
-                raise RuntimeError(
-                    f"Could not resolve option instrument {symbol!r} from Derive "
-                    f"(lookup returned {len(res)} instruments — Cloudflare block?)"
-                )
-    except Exception:
-        if instrument_type == "option" and not base_asset_address:
-            raise
-        # perps: fall back to known XRP constants on any other error
-        pass
-    if not base_asset_address:
-        # known default for XRP-PERP
-        asset_address = _PROTOCOL["asset_addresses"]["XRP"]
-    else:
-        asset_address = base_asset_address
+    inst = await public("get_instrument", {"instrument_name": instrument_name})
+    asset_address = (inst or {}).get("base_asset_address")
+    if not asset_address:
+        raise RuntimeError(f"Derive has no instrument {instrument_name!r}")
+    asset_sub_id = int((inst or {}).get("base_asset_sub_id") or 0)
 
-    # Derive's on-chain TradeModuleData is keyed by (asset_address, sub_id) for
-    # BOTH perps and options. For options, the instrument lookup above already
-    # resolved the option's base_asset_address + base_asset_sub_id, which we feed
-    # into the same ABI. The `instrument_name` in the body tells the API which
-    # instrument; the signed action uses asset+sub_id. (Do NOT switch to a
-    # string-instrument_name ABI — Derive rejects it with code 14014.)
-    module_data = {
-        "abi_types": ["address", "uint", "int", "int", "uint", "uint", "bool"],
-        "abi_values": [
+    price, size, fee = _decimal_str(limit_price), _decimal_str(amount), _decimal_str(max_fee)
+    signed = _signed_action(
+        creds,
+        ["address", "uint256", "int256", "int256", "uint256", "uint256", "bool"],
+        [
             _checksum(asset_address),
-            int(base_sub_id),
-            _to_big(float(_price_str(limit_price))),
-            _to_big(amount),
-            _to_big(float(max_fee)),
-            int(creds["sub_id"] or 0),  # recipient_id
-            True if direction == "buy" else False,  # is_bid
+            asset_sub_id,
+            _to_big(price),
+            _to_big(size),
+            _to_big(fee),
+            int(creds["sub_id"]),  # recipient = own subaccount
+            direction == "buy",
         ],
-        "extra": {},
-    }
-    signed = _signed_action(creds, module_data, "order")
-    payload = {
+    )
+    params = {
         **signed,
-        "asset_address": asset_address,
-        # Derive's API expects sub_id as a STRING for options (the value can exceed
-        # what a JSON integer round-trips cleanly). For perps it is "0".
-        "sub_id": str(base_sub_id),
-        # Strings must re-parse to the SAME big-ints we signed. Never use
-        # format specs like .4g — they round and Derive returns 14014.
-        "limit_price": _price_str(limit_price),
-        "type": "order",
-        "max_fee": str(max_fee),
-        "amount": str(amount),
-        "instrument_name": symbol,
-        "label": label,
-        "is_bid": direction == "buy",
+        "instrument_name": instrument_name,
         "direction": direction,
+        "amount": size,
+        "limit_price": price,
+        "max_fee": fee,
         "order_type": order_type,
-        "mmp": False,
         "time_in_force": time_in_force,
-        "recipient_id": int(creds["sub_id"] or 0),
+        "label": label,
+        "mmp": False,
     }
-    method = "order_debug" if debug else "order"
-    return await _post(creds, method, payload)
+    return await _post(creds, "order_debug" if debug else "order", params)

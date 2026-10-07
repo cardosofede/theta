@@ -16,6 +16,7 @@ default_config:
   min_base_xrp: 10
   reload_band: 0.02
   reopen_flat_ticks: 2
+  park_auto: true
   risk_limits:
     max_position_size_quote: 320
     max_open_executors: 1
@@ -24,8 +25,6 @@ default_config:
     require_triple_barrier: true
     require_trailing_stop: false
 default_trading_context: 'Trade XRP-USDC on derive_perpetual. Post FXRP as margin. Leave half the wallet as USDC sleeve.'
-park_auto: true
-park_dry_run: true
 created_by: 0
 created_at: '2026-08-19T00:00:00+00:00'
 ---
@@ -129,8 +128,9 @@ Never increase size while in drawdown. When DD heals under 4%, return to full wo
 ## Tick sequence (300s)
 
 **0 — Park.** If `park_auto`, run `theta_park`.  
-`park_dry_run: true` → plan only (default until FXRP mint is done).  
-`false` → convert spare USDC above sleeve → XRP → FXRP posted. Idempotent if FXRP already up.  
+Read-only: reports FXRP posted vs target and the gap. Derive v3 deposits are
+Ethereum L1 transactions, so posting FXRP is a manual Derive UI step — the clerk
+never moves funds. Until it says **done**, size the hedge from free margin.  
 Prefer a **PM** subaccount for FXRP efficiency when the house allows; SM works but haircuts harder.
 
 **1 — Tape.** `theta_tape` → `SIT` or `WRITE`, funding %/h, nearest week call.  
@@ -194,12 +194,12 @@ If dry-run: journal strike only — **not** P&L. Never size the race around call
 - Do not treat options WRITE as required for competition score.  
 - Do not add size in drawdown.  
 - Do not run two shorts.  
-- Do not flip `park_dry_run: false` until mint/park is verified on this account.
+- Do not assume FXRP is posted until `theta_park` says **done**.
 
 ## Organizer / race boot
 
 1. Derive `derive_perpetual` credentials on the bot account.  
-2. Fund USDC sleeve; mint/park FXRP when ready; set `park_dry_run` accordingly.  
+2. Fund USDC sleeve; mint FXRP and deposit it in the Derive UI; confirm `theta_park` says done.  
 3. Start `theta` / `theta_funding_desk` in **loop**.  
 4. `python agents/theta/tests/validate_agent.py` && pure tests.  
 5. First ticks: margin allowed short &gt; 0, one fillable OPEN, journal CLEAN.

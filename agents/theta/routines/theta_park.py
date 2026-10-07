@@ -1,20 +1,21 @@
-"""Automated PARK: USDC -> XRP -> wrap FXRP, posted as perp margin.
+"""PARK check: is enough FXRP posted as margin, and how much is still missing?
 
-Runs as theta's step 0 when ``park_auto`` is on. Idempotent: if FXRP is
-already posted, it does nothing. Never converts the whole wallet — it leaves
-the USDC sleeve per the desk's split rule, so liquidation room stays free.
+Runs as theta's step 0 when ``park_auto`` is on. Read-only: it reads the
+subaccount's collaterals via Derive's v3 API (see _theta_derive) and reports
+the gap against the target, leaving the USDC sleeve per the desk's split rule.
 
-Derive's perp margin is FXRP (wrapped XRP). Hummingbot's derive_perpetual
-connector is perps-only and cannot do this, so we call Derive's native REST
-API directly (see _theta_derive). Credentials live in
-``secrets/derive.json`` (copy from derive.json.example, same key you
-registered in Condor Keys & Wallets).
+Derive v3 removed the ``private/deposit`` RPC — deposits are Ethereum L1
+calls (https://docs.derive.xyz/getting-started/depositing), so posting FXRP
+is a manual step in the Derive UI (see README "Funding the desk").
+Credentials come from the Condor keystore, with ``secrets/derive.json`` as a
+fallback.
 
-No perpetual order is placed here. This is setup, not the hedge.
+No order is placed here. This is setup, not the hedge.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from pathlib import Path as _P
 from pydantic import BaseModel, Field
@@ -28,32 +29,20 @@ _THIS = _P(__file__).resolve().parent
 _SECRETS = _THIS / "secrets" / "derive.json"
 
 
-def _math():
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("_theta_math", _THIS / "_theta_math.py")
+def _theta_mod(name: str):
+    path = _P(__file__).with_name(name + ".py")
+    spec = importlib.util.spec_from_file_location("theta_" + name, path)
     if spec is None or spec.loader is None:
-        raise ImportError("theta math helper not found")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _derive():
-    # local import keeps the routine loadable even if the helper is absent;
-    # mirrors the _theta_mod pattern used by the other theta routines.
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("_theta_derive", _THIS / "_theta_derive.py")
-    if spec is None or spec.loader is None:
-        raise ImportError("theta_derive helper not found")
+        raise ImportError(name)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 class Config(BaseModel):
-    enabled: bool = Field(default=True, description="Run automated PARK if FXRP not yet posted")
+    """Check posted FXRP against the PARK target. Read-only."""
+
+    enabled: bool = Field(default=True, description="Run the PARK check")
     wallet_usd: float = Field(default=0.0, description="If >0, split half FXRP / half sleeve. 0 = manual legs")
     fxrp_target: float = Field(default=400.0, description="FXRP to post (quote). Ignored if wallet_usd>0")
     usdc_sleeve: float = Field(default=400.0, description="USDC to leave as sleeve. Ignored if wallet_usd>0")
@@ -64,7 +53,6 @@ class Config(BaseModel):
         default="",
         description="Optional path to derive.json. Empty = use the Condor keystore.",
     )
-    dry_run: bool = Field(default=True, description="If true, compute and report but do not convert/wrap")
 
 
 async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -73,7 +61,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     async def _out(lines: list[str], kpis: list[tuple]) -> str:
         text = "\n".join(lines)
         try:
-            rid = await _math().save_report(
+            rid = await _theta_mod("_theta_math").save_report(
                 "THETA park",
                 "theta_park",
                 kpis,
@@ -96,7 +84,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             [("PARK", "disabled")],
         )
 
-    d = _derive()
+    d = _theta_mod("_theta_derive")
     try:
         creds = d.load_credentials(config.creds_file or _SECRETS)
     except (FileNotFoundError, ValueError) as exc:
@@ -104,7 +92,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             [
                 "THETA park — BLOCKED: derive.json not ready.",
                 f"  {exc}",
-                "  Copy routines/secrets/derive.json.example -> secrets/derive.json and fill the key.",
+                "  Register the Derive key in Condor Keys & Wallets (or set creds_file).",
             ],
             [("PARK", "blocked")],
         )
@@ -145,42 +133,13 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
         )
         return await _out(lines, kpis + [("PARK", "done", None, "up")])
 
-    if config.dry_run:
-        lines.append("DRY-RUN: would move spare USDC -> XRP, then deposit XRP (arrives as FXRP).")
-        lines.append("Set dry_run=false to submit the SignedAction(s) to Derive.")
-        return await _out(lines, kpis + [("PARK", "dry-run")])
-
-    need_fxrp = fxrp_target - fxrp
-    usable_usdc = max(0.0, usdc - usdc_sleeve)
-    if usable_usdc <= 0:
-        lines.append(
-            "No USDC spare beyond sleeve — cannot PARK. Fund the account or lower the sleeve."
-        )
-        return await _out(lines, kpis + [("PARK", "no spare")])
-
-    try:
-        if xrp > 0:
-            amt = min(xrp, need_fxrp + 0.0)
-            res = await d.deposit(creds, "XRP", round(amt, 2))
-            lines.append(f"deposit XRP {amt:.2f} -> FXRP: {res}")
-            need_fxrp -= amt
-        if need_fxrp > 0.5 and xrp <= 0:
-            lines.append(
-                "No XRP held to wrap. Would need to convert USDC->XRP first (not yet implemented as a live swap)."
-            )
-            lines.append("PARK partial: only deposits possible with existing XRP.")
-    except Exception as exc:  # noqa: BLE001
-        return await _out(
-            lines + [f"PARK execution error: {exc}"],
-            kpis + [("PARK", "error", None, "down")],
-        )
-
-    try:
-        final = await d.get_balances(creds)
-        lines.append(
-            f"after: USDC {final.get('USDC',0):.2f}  XRP {final.get('XRP',0):.2f}  FXRP {final.get('FXRP',0):.2f}"
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    lines.append("PARK attempt complete. Hedge loop may now open the short.")
-    return await _out(lines, kpis + [("PARK", "attempted")])
+    need_fxrp = round(fxrp_target - fxrp, 2)
+    spare_usdc = round(max(0.0, usdc - usdc_sleeve), 2)
+    lines.append(
+        f"PARK pending: post {need_fxrp:.2f} more FXRP (spare USDC above sleeve {spare_usdc:.2f})."
+    )
+    lines.append(
+        "Derive v3 deposits are Ethereum L1 transactions — deposit FXRP in the Derive UI. "
+        "Hedge sizes from free margin until then."
+    )
+    return await _out(lines, kpis + [("PARK", "pending", None, "down")])
